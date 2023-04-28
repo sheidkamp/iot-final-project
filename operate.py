@@ -16,7 +16,7 @@ from tflite_support.task import vision
 import utils
 
 
-pir = MotionSensor(17)
+pir = MotionSensor(17, threshold=0.3)
 button = Button(2)
 
 
@@ -33,7 +33,7 @@ def look(model: str, camera_id: int, width: int, height: int, num_threads: int,
 	num_threads: The number of CPU threads to run the model.
 	enable_edgetpu: True/False whether the model is a EdgeTPU model.
 	"""
-	global person_detected, person_detected_at, animal_detected_at
+	global person_detected_at, animal_detected_at
 
 	# Variables to calculate FPS
 	counter, fps = 0, 0
@@ -66,6 +66,7 @@ def look(model: str, camera_id: int, width: int, height: int, num_threads: int,
 	while cap.isOpened():
 		#print("webcam loop")
 		if camera_stop.is_set():
+			print("Breaking loop")
 			break
 		success, image = cap.read()
 		if not success:
@@ -85,48 +86,41 @@ def look(model: str, camera_id: int, width: int, height: int, num_threads: int,
 		# Run object detection estimation using the model.
 		detection_result = detector.detect(input_tensor)
 
-		#print("Detection!", detection_result)
-		person_detected = False
-
 		for detection in detection_result.detections:
 			category = detection.categories[0]
 			category_name = category.category_name
 			print("Found:", category_name)
 			if category_name == "person":
-				person_detected = True
+				print("Found Person")
 				person_detected_at = time.time()
 
 			if category_name == "teddy bear":
 				animal_detected_at = time.time()
 
-		#if person_detected: print("Found Person")
+		image = utils.visualize(image, detection_result)
+		# Calculate the FPS
+		if counter % fps_avg_frame_count == 0:
+			end_time = time.time()
+			fps = fps_avg_frame_count / (end_time - start_time)
+			start_time = time.time()
 
-		# image = utils.visualize(image, detection_result)
-		# # Calculate the FPS
-		# if counter % fps_avg_frame_count == 0:
-		# 	end_time = time.time()
-		# 	fps = fps_avg_frame_count / (end_time - start_time)
-		# 	start_time = time.time()
+		# Show the FPS
+		fps_text = 'FPS = {:.1f}'.format(fps)
+		text_location = (left_margin, row_size)
+		cv2.putText(image, fps_text, text_location, cv2.FONT_HERSHEY_PLAIN,
+					font_size, text_color, font_thickness)
 
-		# # Show the FPS
-		# fps_text = 'FPS = {:.1f}'.format(fps)
-		# text_location = (left_margin, row_size)
-		# cv2.putText(image, fps_text, text_location, cv2.FONT_HERSHEY_PLAIN,
-		# 			font_size, text_color, font_thickness)
-
-		# # Stop the program if the ESC key is pressed.
-		# if cv2.waitKey(1) == 27:
-		# 	break
-		# cv2.imshow('object_detector', image)
+		# Stop the program if the ESC key is pressed.
+		if cv2.waitKey(1) == 27:
+			break
+		cv2.imshow('object_detector', image)
 
 	cap.release()
-	# cv2.destroyAllWindows()
+	cv2.destroyAllWindows()
 	print("Stopping webcam")
 
 ###
 button_pressed = False
-motion_detected = False
-person_detected = False
 person_detected_at = 0
 button_at = 0
 animal_detected_at = 0
@@ -159,7 +153,7 @@ def watch_button():
     
 
 def watch_motion_detector():
-	global motion_detected, camera_stop, person_detected, person_detected_at
+	global camera_stop, person_detected_at
 
 	model = 'efficientdet_lite0.tflite'
 	cameraId = 0
@@ -168,26 +162,33 @@ def watch_motion_detector():
 	numThreads = 2
 	enableEdgeTPU = False
 
+	thread_running = False
+	last_motion_at = 0
+	look_thread = None
+
 	while True:
-		pir.wait_for_motion()
-		print("motion!")
-		camera_stop = threading.Event()
-		look_thread = threading.Thread(target = look, args=(model, int(cameraId), frameWidth, frameHeight,
-			int(numThreads), bool(enableEdgeTPU)))
-		look_thread.start()
-		motion_detected = True
-		
-		pir.wait_for_no_motion()
-		until_at_least = time.time() + 3
-		print("Still!")
+		# IS there motion and no thread?
+		if pir.motion_detected:
+			#print("Motion")
+			last_motion_at = time.time()
+			if not thread_running:
+				print("Starting look thread!")
+				camera_stop = threading.Event()
+				look_thread = threading.Thread(target = look, args=(model, int(cameraId), frameWidth, frameHeight,
+					int(numThreads), bool(enableEdgeTPU)))
+				look_thread.start()
+				thread_running = True
+		else:
+			# print("No motion")
+			# print("Time since last mostion", time.time() - last_motion_at, "recent_person", recent_person())
+			if time.time() - last_motion_at > 5 and not recent_person() and thread_running:
+				print("Killing look thread")
+				camera_stop.set()
+				look_thread.join()
+				thread_running = False
 
-		while person_detected or (until_at_least > time.time()):
-			time.sleep(0.2)
-
-		camera_stop.set()
-		
-		motion_detected = False
-		look_thread.join()
+				
+		time.sleep(0.05)
 
 
 RED_PIN = 27
@@ -217,7 +218,6 @@ def recently(value, delta=3):
 	return False
 
 def run():
-	global person_detected
 	GPIO.setmode(GPIO.BCM)
 	setup_leds()
 	pi = pigpio.pi()
@@ -227,9 +227,9 @@ def run():
 	if not pi.connected:
 		exit()
 
+	print("Starting")
 	was_open = False
 	while True:	
-		# print("bp", button_pressed, "md", motion_detected, "pd", person_detected)
 		if button_pressed or recent_button() or (recent_person() and not recent_animal()):
 			#print("button pressed: ", button_pressed)
 			#print("recent_person", recent_person(), "recent_button", recent_button())
